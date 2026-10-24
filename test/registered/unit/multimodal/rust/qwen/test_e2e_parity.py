@@ -24,12 +24,20 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
+from sglang.srt.rust_server.multimodal import (  # noqa: E402
+    RustMmProcessor,
+    RustMmSpec,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
-from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
+from _mm_rust_utils import (  # noqa: E402
+    PROCESSOR_CONFIGS,
+    image_bytes,
+    load_core,
+    spec_json,
+)
 
 register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
@@ -46,6 +54,7 @@ class TestQwenE2eParity(CustomTestCase):
     """The torchvision backend a default server runs."""
 
     image_processor = "Qwen2VLImageProcessor"
+    resample = "aten_u8"
 
     def setUp(self):
         import transformers.models.qwen2_vl as qwen2_vl
@@ -63,25 +72,32 @@ class TestQwenE2eParity(CustomTestCase):
     # --- the two paths under comparison ---
 
     def native_spec(self):
-        """Resolve the spec through the production gate, so a gate that stops
-        recognizing this image processor fails here too."""
-        from sglang.srt.managers.multimodal_processor import import_processors
-
-        import_processors("sglang.srt.multimodal.processors")
-        # Skip __init__: it would build a processor; reuse the fixture's.
-        host = RustMmProcessor.__new__(RustMmProcessor)
-        host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
-        host._processor = self.processor._processor
-        host.server_args = self.processor.server_args
-        spec = host.resolve_spec()
-        self.assertIsNotNone(spec, f"gate rejected {self.image_processor}")
-        return spec
+        """The driver's spec JSON and the drain spec for the fixture's tokens."""
+        config = PROCESSOR_CONFIGS["qwen2_5_vl"]
+        drain_spec = RustMmSpec(
+            family="qwen_vl",
+            feature_shm=False,
+            model_path="fixture",
+            tokenizer_path="fixture",
+            revision=None,
+            image_processor_backend="auto",
+            image_overrides=None,
+            image_token_id=2,
+            vision_start_token_id=1,
+            vision_end_token_id=3,
+            video_token_id=5,
+        )
+        feature_dim = 3 * config["temporal_patch_size"] * config["patch_size"] ** 2
+        driver_spec = spec_json(config, image_token_id=2, resample=self.resample)
+        return SimpleNamespace(
+            rust_json=driver_spec, feature_dim=feature_dim, drain=drain_spec
+        )
 
     def run_native(self, spec, sources):
         """The Rust path: the `process_mm` driver, then the drain
         adapter — the same two steps `RustServer.drain` performs."""
         ids, features, grids, hashes, offsets, mrope, delta = DRIVER(
-            PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json()
+            PROMPT_PER_IMAGE * len(sources), sources, spec.rust_json
         )
         # The `mm.*` buffers of one `IngressRequest`, inline transport
         # (test_wrap_encoded pins the shm shape): the binding concatenates the
@@ -111,7 +127,7 @@ class TestQwenE2eParity(CustomTestCase):
                 row * spec.feature_dim : (row + n) * spec.feature_dim
             ].reshape(n, spec.feature_dim)
             row += n
-        return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
+        return snapshot(ids, RustMmProcessor.wrap_encoded(spec.drain, buffers))
 
     def run_python(self, sources):
         """The reference path: the Python `mm_processor` the scheduler would use."""
@@ -165,6 +181,7 @@ class TestQwenE2eParityPil(TestQwenE2eParity):
     alone, so running it under one backend is enough."""
 
     image_processor = "Qwen2VLImageProcessorPil"
+    resample = "pil"
 
     def test_source_form_is_transport_only(self):
         """Bytes, a data: URL and a file:// path must yield one identical result."""

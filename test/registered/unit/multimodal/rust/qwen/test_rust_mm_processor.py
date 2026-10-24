@@ -22,12 +22,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.mm_utils import hash_feature  # noqa: E402
-from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor  # noqa: E402
-from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
+from _mm_rust_utils import (  # noqa: E402
+    PROCESSOR_CONFIGS,
+    image_bytes,
+    load_core,
+    spec_json,
+)
 
 register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
@@ -47,11 +51,6 @@ def raw_bytes(source):
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
 class TestQwenRustMmHashes(CustomTestCase):
     def setUp(self):
-        from sglang.srt.managers.multimodal_processor import import_processors
-
-        # The hash helper builds RustMmProcessor via __new__ (no __init__),
-        # so processors must be registered here for resolve_spec's lookup.
-        import_processors("sglang.srt.multimodal.processors")
         self.processor = make_processor(self, PROCESSOR_CONFIGS["qwen2_5_vl"])
 
     def tearDown(self):
@@ -59,15 +58,10 @@ class TestQwenRustMmHashes(CustomTestCase):
         self.processor.cpu_executor.shutdown()
 
     def native_hashes(self, sources):
-        """Per-item hashes the Rust driver returns, via the production gate."""
-        host = RustMmProcessor.__new__(RustMmProcessor)
-        host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
-        host._processor = self.processor._processor
-        host.server_args = self.processor.server_args
-        spec = host.resolve_spec()
-        self.assertIsNotNone(spec, "gate rejected the fixture processor")
+        """Per-item hashes the Rust driver returns."""
+        spec = spec_json(PROCESSOR_CONFIGS["qwen2_5_vl"], image_token_id=2)
         input_ids = [t for _ in sources for t in (1, 2, 3, 4)]
-        return DRIVER(input_ids, sources, spec.rust_json())[3]
+        return DRIVER(input_ids, sources, spec)[3]
 
     def test_native_hashes_the_raw_source_bytes(self):
         """Same image in any source form hashes identically, because the hash is

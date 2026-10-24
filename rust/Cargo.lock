@@ -3765,6 +3765,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -3796,7 +3797,6 @@ dependencies = [
  "arc-swap",
  "async-stream",
  "axum",
- "base64 0.22.1",
  "bytemuck",
  "bytes",
  "chrono",
@@ -3820,6 +3820,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-api-types",
+ "sglang-mm",
  "sglang-processor",
  "sha2",
  "socket2",
@@ -3831,7 +3832,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "ureq",
  "uuid",
 ]
 
