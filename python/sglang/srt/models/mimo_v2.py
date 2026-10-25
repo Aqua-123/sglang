@@ -23,6 +23,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.batch_overlap.attn_overlap import (
+    can_overlap_attn,
+    forward_layers_attn_overlap,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -1169,6 +1173,18 @@ class MiMoV2Model(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
             )
+        elif (
+            not self.layers_to_capture
+            and self.start_layer == 0
+            and can_overlap_attn(forward_batch)
+            and (
+                overlapped := forward_layers_attn_overlap(
+                    self.layers[: self.end_layer], positions, forward_batch, hidden_states
+                )
+            )
+            is not None
+        ):
+            hidden_states = overlapped
         else:
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
