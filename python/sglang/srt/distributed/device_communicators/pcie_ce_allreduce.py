@@ -51,7 +51,10 @@ _WORLD_SIZE = 4
 _ALIGN = 4096
 _FLAG_STRIDE = 64  # one cache line per counter
 _RS, _X, _AG, _DONE = range(4)
-_STAGES = ("out", "k1", "h2d", "k2", "loc")
+_STAGES = ("out", "k0", "k1", "h2d", "k2", "loc")
+# Streams that launch kernels: k0 quantizes, loc dequantizes in quantized mode.
+_KERNEL_STAGES = ("k0", "k1", "k2", "loc")
+_QUANT_MODES = ("int8", "fp8")
 _MAX_CHUNKS = 16
 # Outbound schedule offsets, tuned on 8x RTX PRO 6000 (lead=lag=2 beat 1, 3, 8).
 _LEAD = 2
@@ -83,6 +86,102 @@ def _add_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
         a = tl.load(a_ptr + offs, mask=mask).to(tl.float32)
         b = tl.load(b_ptr + offs, mask=mask).to(tl.float32)
         tl.store(out_ptr + offs, (a + b).to(out_ptr.dtype.element_ty), mask=mask)
+
+
+# Quantized wire format. A chunk of E elements travels as one span:
+# [round_up(E, QB) int8 or fp8 codes | one fp32 scale per QB-element block].
+
+
+@triton.jit
+def _tile(t, n, QB: tl.constexpr, ROWS: tl.constexpr):
+    rows = t * ROWS + tl.arange(0, ROWS)
+    offs = rows[:, None] * QB + tl.arange(0, QB)[None, :]
+    return rows, offs, offs < n, rows < tl.cdiv(n, QB)
+
+
+@triton.jit
+def _decode(q_ptr, s_ptr, rows, offs, mask, row_mask, FP8: tl.constexpr):
+    q = tl.load(q_ptr + offs, mask=mask, other=0)
+    if FP8:
+        v = q.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    else:
+        v = q.to(tl.int8, bitcast=True).to(tl.float32)
+    return v * tl.load(s_ptr + rows, mask=row_mask, other=0.0)[:, None]
+
+
+@triton.jit
+def _encode(v, q_ptr, s_ptr, rows, offs, mask, row_mask, FP8: tl.constexpr):
+    """Store v block-scaled; return the values a receiver will decode."""
+    qmax = 448.0 if FP8 else 127.0
+    amax = tl.max(tl.abs(tl.where(mask, v, 0.0)), axis=1)
+    scale = amax / qmax
+    y = v * tl.where(amax > 0, qmax / amax, 0.0)[:, None]
+    if FP8:
+        qf = y.to(tl.float8e4nv).to(tl.float32)
+        q = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    else:
+        qf = tl.where(y >= 0, y + 0.5, y - 0.5).to(tl.int32).to(tl.float32)
+        q = qf.to(tl.int8).to(tl.uint8, bitcast=True)
+    tl.store(q_ptr + offs, q, mask=mask)
+    tl.store(s_ptr + rows, scale, mask=row_mask)
+    return qf * scale[:, None]
+
+
+@triton.jit
+def _quant_kernel(
+    x_ptr, q_ptr, s_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+):
+    for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
+        rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
+        v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        _encode(v, q_ptr, s_ptr, rows, offs, mask, row_mask, FP8)
+
+
+@triton.jit
+def _decode_add_encode_kernel(
+    aq, as_, x_ptr, oq, os_, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+):
+    """o = encode(decode(a) + x); o may alias a."""
+    for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
+        rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, FP8)
+        v += tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        _encode(v, oq, os_, rows, offs, mask, row_mask, FP8)
+
+
+@triton.jit
+def _decode2_add_encode_kernel(
+    aq,
+    as_,
+    bq,
+    bs,
+    oq,
+    os_,
+    out_ptr,
+    n,
+    QB: tl.constexpr,
+    ROWS: tl.constexpr,
+    FP8: tl.constexpr,
+):
+    """o = encode(decode(a) + decode(b)); out = what o decodes to. o may alias
+    an input. The compiler fuses one decode into an FMA, so the sum is only
+    bitwise reproducible if every rank passes the operands in the same order."""
+    for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
+        rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, FP8)
+        v += _decode(bq, bs, rows, offs, mask, row_mask, FP8)
+        v = _encode(v, oq, os_, rows, offs, mask, row_mask, FP8)
+        tl.store(out_ptr + offs, v.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _decode_kernel(
+    q_ptr, s_ptr, out_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+):
+    for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
+        rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
+        v = _decode(q_ptr, s_ptr, rows, offs, mask, row_mask, FP8)
+        tl.store(out_ptr + offs, v.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @dataclass(frozen=True)
@@ -194,8 +293,20 @@ class PcieCeAllReduce:
         capacity_bytes: int = 128 << 20,
         chunk_bytes: int = 4 << 20,
         num_ctas: int = 16,
+        quant: Optional[str] = None,
+        quant_block: int = 32,
     ):
+        """``quant`` ("int8" or "fp8") sends every payload block-scaled with one
+        fp32 scale per ``quant_block`` elements, halving link bytes. Each hop
+        re-quantizes, so the result carries three rounding steps; ranks stay
+        bitwise equal. On activations with outlier channels fp8 e4m3 is the
+        more accurate: an outlier sets its block's int8 step for every other
+        element in the block, while e4m3 keeps a per-element exponent."""
+        assert quant in (None, *_QUANT_MODES), quant
+        assert _ALIGN // 4 % quant_block == 0, quant_block
         self.disabled = True
+        self.quant = quant
+        self.quant_block = quant_block
         self.group = group
         self.device = torch.device(device)
         self.min_bytes = min_bytes
@@ -232,16 +343,16 @@ class PcieCeAllReduce:
             # scheduled ahead of the compute stream's.
             self._streams = [
                 torch.cuda.Stream(
-                    self.device, priority=-100 if st in ("k1", "k2") else 0
+                    self.device, priority=-100 if st in _KERNEL_STAGES else 0
                 )
                 for st in _STAGES
             ]
             self._cu = [drv.CUstream(st.cuda_stream) for st in self._streams]
             no_timing = drv.CUevent_flags.CU_EVENT_DISABLE_TIMING
-            # summed / landed / reduced per chunk, then one per stream for the join.
+            # encoded / summed / landed / reduced per chunk, then the join.
             self._events = [
                 _ok(drv.cuEventCreate(no_timing))
-                for _ in range(3 * _MAX_CHUNKS + len(_STAGES) + 1)
+                for _ in range(4 * _MAX_CHUNKS + len(_STAGES) + 1)
             ]
             self._calls = 0
             self._chunk_seq = 0
@@ -383,7 +494,15 @@ class PcieCeAllReduce:
         align = _ALIGN // es
         mid = n // 2 // align * align
         halves = ((0, mid), (mid, n))
-        n_chunks = max(1, min(_MAX_CHUNKS, mid * es // self.chunk_bytes))
+        quant = self.quant is not None
+        n_chunks = mid * es // self.chunk_bytes
+        if quant:
+            # A quantized chunk puts half the bytes on the wire, so halve the
+            # chunk count and the host launches with it, keeping up to 4
+            # chunks to overlap the stages: 67 MB enqueues in 0.69 ms instead
+            # of 1.3 ms, and 2 chunks made 33 MB 24% slower than 4.
+            n_chunks = max(min(n_chunks, 4), n_chunks // 2)
+        n_chunks = max(1, min(_MAX_CHUNKS, n_chunks))
         mine = _chunks(*halves[topo.half], n_chunks, align)
         theirs = _chunks(*halves[1 - topo.half], n_chunks, align)
         my_lo, their_lo = mine[0][0], theirs[0][0]
@@ -399,8 +518,6 @@ class PcieCeAllReduce:
         turn = topo.half
 
         in_ptr, out_ptr = inp.data_ptr(), out.data_ptr()
-        recv_rs = self._recv_rs.view(inp.dtype)
-        recv_x = self._recv_x.view(inp.dtype)
         rs_ptr, ag_ptr, x_ptr = (
             self._recv_rs.data_ptr(),
             self._recv_ag.data_ptr(),
@@ -412,11 +529,19 @@ class PcieCeAllReduce:
         memcpy = drv.cuMemcpyAsync
         wait, write = drv.cuStreamWaitValue32, drv.cuStreamWriteValue32
         record, wait_event = drv.cuEventRecord, drv.cuStreamWaitEvent
-        s_out, s_k1, s_h2d, s_k2, s_loc = self._cu
-        t_k1, t_k2 = self._streams[1], self._streams[3]
+        s_out, s_k0, s_k1, s_h2d, s_k2, s_loc = self._cu
+        t_k0, t_k1, t_k2, t_loc = (self._streams[i] for i in (1, 2, 4, 5))
         ev = self._events
-        summed, landed, reduced = ev[0:], ev[_MAX_CHUNKS:], ev[2 * _MAX_CHUNKS :]
-        start, joins = ev[3 * _MAX_CHUNKS], ev[3 * _MAX_CHUNKS + 1 :]
+        encoded, summed, landed, reduced = (ev[i * _MAX_CHUNKS :] for i in range(4))
+        start, joins = ev[4 * _MAX_CHUNKS], ev[4 * _MAX_CHUNKS + 1 :]
+
+        def span(a: int, b: int) -> Tuple[int, int]:
+            """Byte offset and size on the wire of elements [a, b) of a half."""
+            if not quant:
+                return a * es, (b - a) * es
+            qb = self.quant_block
+            padded = _round_up(b - a, qb)
+            return a + a // qb * 4, padded + padded // qb * 4
 
         caller = drv.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
         record(start, caller)
@@ -431,36 +556,51 @@ class PcieCeAllReduce:
             if kind == "rs":
                 # 1a. partner's half of my input -> partner's recv_rs
                 lo, hi = theirs[c]
-                memcpy(
-                    peer_rs + (lo - their_lo) * es,
-                    in_ptr + lo * es,
-                    (hi - lo) * es,
-                    s_out,
-                )
+                off, nbytes = span(lo - their_lo, hi - their_lo)
+                src = in_ptr + lo * es
+                if quant:
+                    # Staged in my recv_ag: the partner's all-gather of this
+                    # chunk lands there only after this push has completed.
+                    with torch.cuda.stream(t_k0):
+                        codes = self._codes(self._recv_ag, off, hi - lo)
+                        self._codec(_quant_kernel, inp[lo:hi], *codes, n=hi - lo)
+                    record(encoded[c], s_k0)
+                    wait_event(s_out, encoded[c], 0)
+                    src = ag_ptr + off
+                memcpy(peer_rs + off, src, nbytes, s_out)
                 write(s_out, flag[me][_RS], tag, _WRITE_FENCED)
                 continue
             lo, hi = mine[c]
             a, b = lo - my_lo, hi - my_lo
-            off, nbytes = a * es, (hi - lo) * es
+            off, nbytes = span(a, b)
             if kind == "ag":
                 # 3a. my finished half -> partner's recv_ag
                 wait_event(s_out, reduced[c], 0)
-                memcpy(peer_ag + off, out_ptr + lo * es, nbytes, s_out)
+                src = x_ptr + off if quant else out_ptr + lo * es
+                memcpy(peer_ag + off, src, nbytes, s_out)
                 write(s_out, flag[me][_AG], tag, _WRITE_FENCED)
                 # 3b. partner's finished half -> out
                 lo, hi = theirs[c]
+                off, nbytes = span(lo - their_lo, hi - their_lo)
                 wait(s_loc, flag[partner][_AG], tag, _WAIT_GEQ)
-                memcpy(
-                    out_ptr + lo * es,
-                    ag_ptr + (lo - their_lo) * es,
-                    (hi - lo) * es,
-                    s_loc,
-                )
+                if quant:
+                    with torch.cuda.stream(t_loc):
+                        codes = self._codes(self._recv_ag, off, hi - lo)
+                        self._codec(_decode_kernel, *codes, out[lo:hi], n=hi - lo)
+                else:
+                    memcpy(out_ptr + lo * es, ag_ptr + off, nbytes, s_loc)
                 continue
-            # 1b. recv_rs += my half of my input
+            # 1b. recv_rs = recv_rs + my half of my input
             wait(s_k1, flag[partner][_RS], tag, _WAIT_GEQ)
             with torch.cuda.stream(t_k1):
-                self._add(recv_rs[a:b], inp[lo:hi], recv_rs[a:b])
+                if quant:
+                    codes = self._codes(self._recv_rs, off, b - a)
+                    self._codec(
+                        _decode_add_encode_kernel, *codes, inp[lo:hi], *codes, n=b - a
+                    )
+                else:
+                    part = self._recv_rs.view(inp.dtype)[a:b]
+                    self._add(part, inp[lo:hi], part)
             record(summed[c], s_k1)
             # 2a. partial sum -> my host slot, alternating with the partner
             wait_event(s_out, summed[c], 0)
@@ -475,7 +615,26 @@ class PcieCeAllReduce:
             wait_event(s_k2, summed[c], 0)
             wait_event(s_k2, landed[c], 0)
             with torch.cuda.stream(t_k2):
-                self._add(recv_rs[a:b], recv_x[a:b], out[lo:hi])
+                if quant:
+                    # The lower rank's pair goes first on both cross peers.
+                    # The encoded result stays in recv_x for the all-gather,
+                    # so the partner decodes exactly my out.
+                    ours = self._codes(self._recv_rs, off, b - a)
+                    theirs_x = self._codes(self._recv_x, off, b - a)
+                    first, second = (ours, theirs_x) if me < cross else (theirs_x, ours)
+                    self._codec(
+                        _decode2_add_encode_kernel,
+                        *first,
+                        *second,
+                        *theirs_x,
+                        out[lo:hi],
+                        n=b - a,
+                    )
+                else:
+                    rs, x = (
+                        t.view(inp.dtype)[a:b] for t in (self._recv_rs, self._recv_x)
+                    )
+                    self._add(rs, x, out[lo:hi])
             record(reduced[c], s_k2)
 
         for s, j in zip(self._cu, joins):
@@ -487,3 +646,16 @@ class PcieCeAllReduce:
         # 4-warp blocks: under a saturating GEMM, 1-4 warps finished a 1 MB
         # all-reduce in 1.4-1.6 ms against 2.2-2.3 ms for 8 warps; idle is equal.
         _add_kernel[(self.num_ctas,)](a, b, out, a.numel(), BLOCK=2048, num_warps=4)
+
+    def _codes(self, buf: torch.Tensor, off: int, n: int):
+        """Code and scale views of the n-element encoded chunk at byte ``off``."""
+        qb = self.quant_block
+        padded = _round_up(n, qb)
+        scales = buf[off + padded : off + padded + padded // qb * 4]
+        return buf[off : off + padded], scales.view(torch.float32)
+
+    def _codec(self, kernel, *args, n: int) -> None:
+        qb = self.quant_block
+        kernel[(self.num_ctas,)](
+            *args, n, QB=qb, ROWS=2048 // qb, FP8=self.quant == "fp8", num_warps=4
+        )
