@@ -1510,6 +1510,8 @@ class Envs:
     # reductions of at least the given size and leaves the rest to NCCL.
     SGLANG_PCIE_CE_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES = EnvInt(16 << 20)
+    # "int8" or "fp8": block-scaled payloads, half the link bytes, lossy.
+    SGLANG_PCIE_CE_ALLREDUCE_QUANT = EnvStr("")
 
     # ===================================================================
     # RoPE cache
