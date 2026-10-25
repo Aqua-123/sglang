@@ -2809,6 +2809,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
+        # Experimental: shift the static FP4 activation window per layer. A smaller
+        # scale keeps small blocks above the E4M3 block-scale floor at the cost of
+        # clipping large values earlier; the GEMM alphas compensate exactly.
+        keep = envs.SGLANG_NVFP4_INPUT_SCALE_KEEP_LAYERS.get()
+        if str(layer.layer_id) not in keep.split(","):
+            w13_input_scale = w13_input_scale * envs.SGLANG_NVFP4_W13_INPUT_SCALE_MULT.get()
+            w2_input_scale = w2_input_scale * envs.SGLANG_NVFP4_W2_INPUT_SCALE_MULT.get()
+        for item in filter(None, envs.SGLANG_NVFP4_INPUT_SCALE_OVERRIDES.get().split(",")):
+            lid, spec = item.split(":")
+            which, mult = spec.split("=")
+            if int(lid) == layer.layer_id:
+                if which == "w13":
+                    w13_input_scale = w13_input_scale * float(mult)
+                else:
+                    w2_input_scale = w2_input_scale * float(mult)
+                logger.warning(f"NVFP4 MoE layer {lid} {which} input scale x{mult}")
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
         ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
