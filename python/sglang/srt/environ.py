@@ -505,6 +505,9 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Prefill batches with at least this many tokens run TP all-reduce and compute of two
+    # token halves on separate streams (batch_overlap/tp_prefill_overlap.py). 0 disables.
+    SGLANG_TP_PREFILL_OVERLAP_MIN_TOKENS = EnvInt(0)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)

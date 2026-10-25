@@ -23,6 +23,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.batch_overlap.tp_prefill_overlap import (
+    can_overlap_tp_prefill,
+    forward_layers_tp_prefill_overlap,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -1168,6 +1172,19 @@ class MiMoV2Model(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
+            )
+        elif (
+            not self.layers_to_capture
+            and self.start_layer == 0
+            and can_overlap_tp_prefill(forward_batch)
+        ):
+            # Layer 0 starts the residual stream on the whole batch; split after it.
+            hidden_states = self.layers[0](positions, hidden_states, forward_batch)
+            hidden_states = forward_layers_tp_prefill_overlap(
+                self.layers[1 : self.end_layer],
+                positions,
+                forward_batch,
+                hidden_states,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
