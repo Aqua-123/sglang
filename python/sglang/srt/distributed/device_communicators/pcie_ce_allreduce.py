@@ -573,7 +573,12 @@ class PcieCeAllReduce:
         halves = ((0, mid), (mid, n))
         quant = self.quant is not None
         n_chunks = mid * es // self.chunk_bytes
-        if quant:
+        if self.quant == "fp4":
+            # About 3 MB of wire per chunk is fastest: 4096 tokens took 0.68 ms
+            # in 1 or 4 chunks and 0.53 ms in 2.
+            wire = self._code_bytes(mid) + mid // self.quant_block * 4
+            n_chunks = min(4, -(-wire // (3 << 20)))
+        elif quant:
             # A quantized chunk puts half the bytes on the wire, so halve the
             # chunk count and the host launches with it, keeping up to 4
             # chunks to overlap the stages: 67 MB enqueues in 0.69 ms instead
