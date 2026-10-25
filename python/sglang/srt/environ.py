@@ -1512,6 +1512,9 @@ class Envs:
     SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES = EnvInt(16 << 20)
     # "int8" or "fp8": block-scaled payloads, half the link bytes, lossy.
     SGLANG_PCIE_CE_ALLREDUCE_QUANT = EnvStr("")
+    # CTAs for the CE add/quant kernels. Prefill all-reduces do not overlap compute, so a
+    # full-GPU grid finishes them fastest; a small grid only helps when competing for SMs.
+    SGLANG_PCIE_CE_ALLREDUCE_CTAS = EnvInt(16)
 
     # ===================================================================
     # RoPE cache

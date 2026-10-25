@@ -519,6 +519,7 @@ class GroupCoordinator:
                     device=self.device,
                     min_bytes=envs.SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES.get(),
                     quant=envs.SGLANG_PCIE_CE_ALLREDUCE_QUANT.get() or None,
+                    num_ctas=envs.SGLANG_PCIE_CE_ALLREDUCE_CTAS.get(),
                 )
             except Exception as e:
                 logger.warning(f"Setup PCIe copy-engine allreduce failed with {e}.")
