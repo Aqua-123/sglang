@@ -1506,6 +1506,10 @@ class Envs:
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+    # Copy-engine all-reduce for TP=4 on two PCIe-switch pairs; serves eager
+    # reductions of at least the given size and leaves the rest to NCCL.
+    SGLANG_PCIE_CE_ALLREDUCE = EnvBool(False)
+    SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES = EnvInt(16 << 20)
 
     # ===================================================================
     # RoPE cache
