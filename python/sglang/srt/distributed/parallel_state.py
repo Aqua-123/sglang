@@ -500,6 +500,27 @@ class GroupCoordinator:
                 )
             except Exception as e:
                 logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
+
+        self.pcie_ce_comm: Optional[Any] = None
+        if (
+            envs.SGLANG_PCIE_CE_ALLREDUCE.get()
+            and group_name == "tp"
+            and self.world_size == 4
+            and is_cuda()
+            and not self._deterministic_collectives_enabled()
+        ):
+            from sglang.srt.distributed.device_communicators.pcie_ce_allreduce import (
+                PcieCeAllReduce,
+            )
+
+            try:
+                self.pcie_ce_comm = PcieCeAllReduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    min_bytes=envs.SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES.get(),
+                )
+            except Exception as e:
+                logger.warning(f"Setup PCIe copy-engine allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -969,6 +990,9 @@ class GroupCoordinator:
             and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
         ):
             return "pcie_ipc"
+        # Large eager reductions only: should_use refuses during graph capture.
+        if self.pcie_ce_comm is not None and self.pcie_ce_comm.should_use(input_):
+            return "pcie_ce"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -1052,6 +1076,8 @@ class GroupCoordinator:
             out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ce":
+            return self.pcie_ce_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -2094,6 +2120,9 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        if self.pcie_ce_comm is not None:
+            self.pcie_ce_comm.destroy()
+            self.pcie_ce_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
