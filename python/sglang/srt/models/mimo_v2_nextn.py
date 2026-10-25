@@ -48,7 +48,6 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2ForCausalLM,
     MiMoV2MLP,
     _resolve_deferred_qkv_scale_inv,
-    get_mimo_v2_fused_qkv_expected_tp_size,
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
