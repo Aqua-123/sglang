@@ -1510,7 +1510,8 @@ class Envs:
     # reductions of at least the given size and leaves the rest to NCCL.
     SGLANG_PCIE_CE_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_CE_ALLREDUCE_MIN_BYTES = EnvInt(16 << 20)
-    # "int8" or "fp8": block-scaled payloads, half the link bytes, lossy.
+    # Block-scaled lossy payloads: a format ("fp4", "fp4/16", "fp6/16", "fp8", ...) for
+    # every stage, or one per stage as "rs+cross+ag". See PcieCeAllReduce.__init__.
     SGLANG_PCIE_CE_ALLREDUCE_QUANT = EnvStr("")
     # CTAs for the CE add/quant kernels. Prefill all-reduces do not overlap compute, so a
     # full-GPU grid finishes them fastest; a small grid only helps when competing for SMs.

@@ -54,7 +54,8 @@ _RS, _X, _AG, _DONE = range(4)
 _STAGES = ("out", "k0", "k1", "h2d", "k2", "loc")
 # Streams that launch kernels: k0 quantizes, loc dequantizes in quantized mode.
 _KERNEL_STAGES = ("k0", "k1", "k2", "loc")
-_QUANT_MODES = ("int8", "fp8", "fp4")  # index = the kernels' MODE
+# Bits per code; the key order gives the kernels' MODE.
+_CODE_BITS = {"int8": 8, "fp8": 8, "fp4": 4, "fp6": 6}
 _MAX_CHUNKS = 16
 # Outbound schedule offsets, tuned on 8x RTX PRO 6000 (lead=lag=2 beat 1, 3, 8).
 _LEAD = 2
@@ -76,6 +77,56 @@ def _round_up(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
 
+@dataclass(frozen=True)
+class _WireFormat:
+    """Block-scaled payload: one scale of ``scale_dtype`` per ``block`` elements."""
+
+    codes: str  # a key of _CODE_BITS
+    block: int
+    scale_dtype: torch.dtype
+
+    @property
+    def mode(self) -> int:
+        return list(_CODE_BITS).index(self.codes)
+
+    def code_bytes(self, n: int) -> int:
+        return n * _CODE_BITS[self.codes] // 8
+
+    def span(self, a: int, b: int) -> Tuple[int, int]:
+        """Byte offset and size on the wire of elements [a, b) of a half."""
+        sb = self.scale_dtype.itemsize
+        padded = _round_up(b - a, self.block)
+        return (
+            self.code_bytes(a) + a // self.block * sb,
+            self.code_bytes(padded) + padded // self.block * sb,
+        )
+
+    def views(self, buf: torch.Tensor, off: int, n: int):
+        """Code and scale views of the n-element encoded chunk at byte ``off``."""
+        padded = _round_up(n, self.block)
+        codes = self.code_bytes(padded)
+        scales = buf[
+            off + codes : off + codes + padded // self.block * self.scale_dtype.itemsize
+        ]
+        return buf[off : off + codes], scales.view(self.scale_dtype)
+
+
+# A bf16 scale per 16 elements costs the same bytes as an fp32 scale per 32,
+# and an outlier then spoils 15 neighbours instead of 31. Measured on 4 GPUs
+# with synthetic heavy-tailed partials (Student-t(3), [2048, 4096]), the
+# all-reduce's relative error is 0.165 for fp4, 0.140 for fp4/16, 0.057 for
+# fp6/16 and 0.032 for fp8; on the channels beside 100-1000x outlier channels
+# it is 0.31, 0.23, 0.066 and 0.033.
+_WIRE_FORMATS = {
+    "int8": _WireFormat("int8", 32, torch.float32),
+    "fp8": _WireFormat("fp8", 32, torch.float32),
+    "fp4": _WireFormat("fp4", 32, torch.float32),
+    "fp8/16": _WireFormat("fp8", 16, torch.bfloat16),
+    "fp4/16": _WireFormat("fp4", 16, torch.bfloat16),
+    "fp6/16": _WireFormat("fp6", 16, torch.bfloat16),
+}
+
+
 @triton.jit
 def _add_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
     start = tl.program_id(0) * BLOCK
@@ -89,11 +140,13 @@ def _add_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
 
 
 # Quantized wire format. A chunk of E elements travels as one span:
-# [round_up(E, QB) codes | one fp32 scale per QB-element block]. int8 and fp8
-# codes take a byte each; fp4 (e2m1) codes pack two to a byte, the even element
-# in the low nibble.
+# [round_up(E, QB) codes | one scale per QB-element block], the scale fp32 or
+# bf16 per the scale pointer. int8 and fp8 codes take a byte each; fp4 (e2m1)
+# codes pack two to a byte, the even element in the low nibble; fp6 (e3m2)
+# codes pack four to three bytes, little-endian, the first element lowest.
 _FP8 = tl.constexpr(1)
 _FP4 = tl.constexpr(2)
+_FP6 = tl.constexpr(3)
 
 
 @triton.jit
@@ -136,6 +189,42 @@ def _e2m1_code(y):
 
 
 @triton.jit
+def _pow2(e):
+    """2.0 ** e for integer e in the normal fp32 range, exactly."""
+    return ((e + 127) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _e3m2_value(c):
+    """Value of a 6-bit e3m2 code: sign in bit 5, then 3 exponent and 2
+    mantissa bits, exponent bias 3, no inf or nan: up to 28, steps of 1/16
+    below 1/4."""
+    e = (c >> 2) & 7
+    m = c & 3
+    v = tl.where(e == 0, m * 0.0625, (4 + m) * _pow2(e - 5))
+    return tl.where((c & 32) != 0, -v, v)
+
+
+@triton.jit
+def _e3m2_code(y):
+    """Nearest e3m2 code of y in [-28, 28], ties away from zero."""
+    a = tl.abs(y)
+    # floor(log2(a)), at least that of the smallest normal; the step is a
+    # quarter of that power of two.
+    e = tl.maximum(((a.to(tl.int32, bitcast=True) >> 23) & 255) - 127, -2)
+    k = tl.floor(a * _pow2(2 - e) + 0.5).to(tl.int32)  # 0..4 if e == -2, else 4..8
+    c = tl.minimum(4 * e + 8 + k, 31)
+    return c | tl.where(y < 0, 32, 0)
+
+
+@triton.jit
+def _fp6_groups(rows, n, QB: tl.constexpr):
+    """Byte offset and mask of each 4-code group of a tile's packed fp6 codes."""
+    g = tl.arange(0, QB // 4)[None, :]
+    return rows[:, None] * (QB // 4 * 3) + g * 3, rows[:, None] * QB + g * 4 < n
+
+
+@triton.jit
 def _decode(
     q_ptr,
     s_ptr,
@@ -152,13 +241,22 @@ def _decode(
         boffs, bmask = _packed(rows, n, QB)
         b = tl.load(q_ptr + boffs, mask=bmask, other=0).to(tl.int32)
         v = tl.reshape(tl.join(_e2m1_value(b & 15), _e2m1_value(b >> 4)), (ROWS, QB))
+    elif MODE == _FP6:
+        goffs, gmask = _fp6_groups(rows, n, QB)
+        w = tl.load(q_ptr + goffs, mask=gmask, other=0).to(tl.int32)
+        w |= tl.load(q_ptr + goffs + 1, mask=gmask, other=0).to(tl.int32) << 8
+        w |= tl.load(q_ptr + goffs + 2, mask=gmask, other=0).to(tl.int32) << 16
+        even = tl.join(w & 63, (w >> 12) & 63)
+        odd = tl.join((w >> 6) & 63, w >> 18)
+        v = _e3m2_value(tl.reshape(tl.join(even, odd), (ROWS, QB)))
     else:
         q = tl.load(q_ptr + offs, mask=mask, other=0)
         if MODE == _FP8:
             v = q.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         else:
             v = q.to(tl.int8, bitcast=True).to(tl.float32)
-    return v * tl.load(s_ptr + rows, mask=row_mask, other=0.0)[:, None]
+    s = tl.load(s_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+    return v * s[:, None]
 
 
 @triton.jit
@@ -178,19 +276,39 @@ def _encode(
     """Store v block-scaled; return the values a receiver will decode."""
     if MODE == _FP4:
         qmax = 6.0
+    elif MODE == _FP6:
+        qmax = 28.0
     elif MODE == _FP8:
         qmax = 448.0
     else:
         qmax = 127.0
     amax = tl.max(tl.abs(tl.where(mask, v, 0.0)), axis=1)
-    scale = amax / qmax
-    y = v * tl.where(amax > 0, qmax / amax, 0.0)[:, None]
+    if s_ptr.dtype.element_ty == tl.float32:
+        scale = amax / qmax
+        y = v * tl.where(amax > 0, qmax / amax, 0.0)[:, None]
+    else:
+        # A bf16 scale rounds to nearest, so y may pass qmax by 2^-9 relative;
+        # every code kind rounds that back to qmax.
+        scale = (amax / qmax).to(s_ptr.dtype.element_ty).to(tl.float32)
+        y = v * tl.where(scale > 0, 1.0 / scale, 0.0)[:, None]
     if MODE == _FP4:
         c = _e2m1_code(y)
         lo, hi = tl.split(tl.reshape(c, (ROWS, QB // 2, 2)))
         boffs, bmask = _packed(rows, n, QB)
         tl.store(q_ptr + boffs, (lo | (hi << 4)).to(tl.uint8), mask=bmask)
         qf = _e2m1_value(c)
+    elif MODE == _FP6:
+        c = _e3m2_code(y)
+        # Split each group's codes j = 2i + k by k, then by i.
+        even, odd = tl.split(tl.reshape(c, (ROWS, QB // 4, 2, 2)))
+        c0, c2 = tl.split(even)
+        c1, c3 = tl.split(odd)
+        w = c0 | (c1 << 6) | (c2 << 12) | (c3 << 18)
+        goffs, gmask = _fp6_groups(rows, n, QB)
+        tl.store(q_ptr + goffs, (w & 255).to(tl.uint8), mask=gmask)
+        tl.store(q_ptr + goffs + 1, ((w >> 8) & 255).to(tl.uint8), mask=gmask)
+        tl.store(q_ptr + goffs + 2, (w >> 16).to(tl.uint8), mask=gmask)
+        qf = _e3m2_value(c)
     else:
         if MODE == _FP8:
             qf = y.to(tl.float8e4nv).to(tl.float32)
@@ -199,7 +317,7 @@ def _encode(
             qf = tl.where(y >= 0, y + 0.5, y - 0.5).to(tl.int32).to(tl.float32)
             q = qf.to(tl.int8).to(tl.uint8, bitcast=True)
         tl.store(q_ptr + offs, q, mask=mask)
-    tl.store(s_ptr + rows, scale, mask=row_mask)
+    tl.store(s_ptr + rows, scale.to(s_ptr.dtype.element_ty), mask=row_mask)
     return qf * scale[:, None]
 
 
@@ -215,14 +333,23 @@ def _quant_kernel(
 
 @triton.jit
 def _decode_add_encode_kernel(
-    aq, as_, x_ptr, oq, os_, n, QB: tl.constexpr, ROWS: tl.constexpr, MODE: tl.constexpr
+    aq,
+    as_,
+    x_ptr,
+    oq,
+    os_,
+    n,
+    QB: tl.constexpr,
+    ROWS: tl.constexpr,
+    MODE_IN: tl.constexpr,
+    MODE_OUT: tl.constexpr,
 ):
-    """o = encode(decode(a) + x); o may alias a."""
+    """o = encode(decode(a) + x); o may alias a if both use one format."""
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
-        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE_IN)
         v += tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
+        _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE_OUT)
 
 
 @triton.jit
@@ -237,16 +364,18 @@ def _decode2_add_encode_kernel(
     n,
     QB: tl.constexpr,
     ROWS: tl.constexpr,
-    MODE: tl.constexpr,
+    MODE_IN: tl.constexpr,
+    MODE_OUT: tl.constexpr,
 ):
     """o = encode(decode(a) + decode(b)); out = what o decodes to. o may alias
-    an input. The compiler fuses one decode into an FMA, so the sum is only
-    bitwise reproducible if every rank passes the operands in the same order."""
+    an input if all use one format. The compiler fuses one decode into an FMA,
+    so the sum is only bitwise reproducible if every rank passes the operands
+    in the same order."""
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
-        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
-        v += _decode(bq, bs, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
-        v = _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE_IN)
+        v += _decode(bq, bs, rows, offs, mask, row_mask, n, QB, ROWS, MODE_IN)
+        v = _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE_OUT)
         tl.store(out_ptr + offs, v.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -370,20 +499,31 @@ class PcieCeAllReduce:
         chunk_bytes: int = 4 << 20,
         num_ctas: int = 16,
         quant: Optional[str] = None,
-        quant_block: int = 32,
     ):
-        """``quant`` ("int8", "fp8" or "fp4") sends every payload block-scaled with
-        one fp32 scale per ``quant_block`` elements: int8 and fp8 halve link bytes,
-        fp4 (e2m1) quarters them. Each hop
-        re-quantizes, so the result carries three rounding steps; ranks stay
-        bitwise equal. On activations with outlier channels fp8 e4m3 is the
-        more accurate: an outlier sets its block's int8 step for every other
-        element in the block, while e4m3 keeps a per-element exponent."""
-        assert quant in (None, *_QUANT_MODES), quant
-        assert _ALIGN // 4 % quant_block == 0, quant_block
+        """``quant`` sends every payload block-scaled in a format of
+        ``_WIRE_FORMATS``: "int8", "fp8" and "fp4" (e2m1) with an fp32 scale
+        per 32 elements, or "fp8/16", "fp6/16" (e3m2) and "fp4/16" with a bf16
+        scale per 16. int8 and fp8 halve link bytes, fp6 cuts them to under
+        half and fp4 to under a third. Each hop re-quantizes, so the result
+        carries three rounding steps; ranks stay bitwise equal. On activations
+        with outlier channels the float codes are the more accurate: an outlier
+        sets its block's int8 step for every other element in the block, while
+        a float code keeps a per-element exponent.
+
+        "rs+cross+ag" picks a format per stage: the reduce-scatter and
+        all-gather inside the pairs, and the partial sums that cross the shared
+        uplink. "pair+cross" is short for "pair+cross+pair". Only the cross
+        format crosses the uplink, but every stage loads each GPU's own link,
+        so a wider pair format still costs time on large messages."""
+        fmts = [_WIRE_FORMATS[f] for f in quant.split("+")] if quant else [None]
+        if len(fmts) < 3:
+            fmts = [fmts[0], fmts[-1], fmts[0]]
+        self.rs_fmt, self.x_fmt, self.ag_fmt = fmts
+        if quant:
+            assert len({f.block for f in fmts}) == 1, quant
+            assert _ALIGN // 4 % fmts[0].block == 0, quant
         self.disabled = True
         self.quant = quant
-        self.quant_block = quant_block
         self.group = group
         self.device = torch.device(device)
         self.min_bytes = min_bytes
@@ -412,6 +552,21 @@ class PcieCeAllReduce:
             # A half is at most half the capacity plus the segment and half
             # rounding (under 16 KiB even for fp32).
             self.half_cap = _round_up(capacity_bytes // 2 + (64 << 10), _ALIGN)
+            # Re-encoding into another format cannot run in place, so a cross
+            # format that differs gets its own region of recv_rs, recv_x and the
+            # host slots, past the rs and ag payloads. recv_ag doubles as the
+            # reduce-scatter staging area; that too moves past the ag payload
+            # if the two formats differ.
+            self._x_base = self._stage_base = 0
+            if quant:
+                # Wire bytes of a half of 16-bit elements in each format.
+                rs, x, ag = (f.span(0, self.half_cap // 2)[1] for f in fmts)
+                if len(set(fmts)) > 1:
+                    self._x_base = _round_up(max(rs, ag), _ALIGN)
+                if fmts[0] != fmts[2]:
+                    self._stage_base = _round_up(ag, _ALIGN)
+                assert self._x_base + x <= self.half_cap, quant
+                assert self._stage_base + rs <= self.half_cap, quant
             self.capacity_bytes = capacity_bytes
             self._setup_device_buffers()
             self._setup_host_region()
@@ -582,11 +737,13 @@ class PcieCeAllReduce:
         mid = n // 2 // align * align
         halves = ((0, mid), (mid, n))
         quant = self.quant is not None
+        rs_fmt, x_fmt, ag_fmt = self.rs_fmt, self.x_fmt, self.ag_fmt
         n_chunks = mid * es // self.chunk_bytes
-        if self.quant == "fp4":
-            # About 3 MB of wire per chunk is fastest: 4096 tokens took 0.68 ms
-            # in 1 or 4 chunks and 0.53 ms in 2.
-            wire = self._code_bytes(mid) + mid // self.quant_block * 4
+        if quant and x_fmt.codes in ("fp4", "fp6"):
+            # About 3 MB of wire per chunk is fastest: fp4 took 0.68 ms for 4096
+            # tokens in 1 or 4 chunks and 0.53 ms in 2. fp6/16 ran as fast in 3
+            # MB chunks as in the 4 MB ones below, with fewer launches.
+            wire = x_fmt.span(0, mid)[1]
             n_chunks = min(4, -(-wire // (3 << 20)))
         elif quant:
             # A quantized chunk puts half the bytes on the wire, so halve the
@@ -627,15 +784,8 @@ class PcieCeAllReduce:
         encoded, summed, landed, reduced = (ev[i * _MAX_CHUNKS :] for i in range(4))
         start, joins = ev[4 * _MAX_CHUNKS], ev[4 * _MAX_CHUNKS + 1 :]
 
-        def span(a: int, b: int) -> Tuple[int, int]:
-            """Byte offset and size on the wire of elements [a, b) of a half."""
-            if not quant:
-                return a * es, (b - a) * es
-            qb = self.quant_block
-            padded = _round_up(b - a, qb)
-            return self._code_bytes(a) + a // qb * 4, (
-                self._code_bytes(padded) + padded // qb * 4
-            )
+        def span(fmt: Optional[_WireFormat], a: int, b: int) -> Tuple[int, int]:
+            return fmt.span(a, b) if quant else (a * es, (b - a) * es)
 
         caller = drv.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
         record(start, caller)
@@ -650,23 +800,30 @@ class PcieCeAllReduce:
             if kind == "rs":
                 # 1a. partner's half of my input -> partner's recv_rs
                 lo, hi = theirs[c]
-                off, nbytes = span(lo - their_lo, hi - their_lo)
+                off, nbytes = span(rs_fmt, lo - their_lo, hi - their_lo)
                 src = in_ptr + lo * es
                 if quant:
                     # Staged in my recv_ag: the partner's all-gather of this
                     # chunk lands there only after this push has completed.
                     with torch.cuda.stream(t_k0):
-                        codes = self._codes(self._recv_ag, off, hi - lo)
-                        self._codec(_quant_kernel, inp[lo:hi], *codes, n=hi - lo)
+                        off_stage = self._stage_base + off
+                        codes = rs_fmt.views(self._recv_ag, off_stage, hi - lo)
+                        self._codec(
+                            _quant_kernel,
+                            inp[lo:hi],
+                            *codes,
+                            n=hi - lo,
+                            MODE=rs_fmt.mode,
+                        )
                     record(encoded[c], s_k0)
                     wait_event(s_out, encoded[c], 0)
-                    src = ag_ptr + off
+                    src = ag_ptr + off_stage
                 memcpy(peer_rs + off, src, nbytes, s_out)
                 write(s_out, flag[me][_RS], tag, _WRITE_FENCED)
                 continue
             lo, hi = mine[c]
             a, b = lo - my_lo, hi - my_lo
-            off, nbytes = span(a, b)
+            off, nbytes = span(ag_fmt, a, b)
             if kind == "ag":
                 # 3a. my finished half -> partner's recv_ag
                 wait_event(s_out, reduced[c], 0)
@@ -675,22 +832,36 @@ class PcieCeAllReduce:
                 write(s_out, flag[me][_AG], tag, _WRITE_FENCED)
                 # 3b. partner's finished half -> out
                 lo, hi = theirs[c]
-                off, nbytes = span(lo - their_lo, hi - their_lo)
+                off, nbytes = span(ag_fmt, lo - their_lo, hi - their_lo)
                 wait(s_loc, flag[partner][_AG], tag, _WAIT_GEQ)
                 if quant:
                     with torch.cuda.stream(t_loc):
-                        codes = self._codes(self._recv_ag, off, hi - lo)
-                        self._codec(_decode_kernel, *codes, out[lo:hi], n=hi - lo)
+                        codes = ag_fmt.views(self._recv_ag, off, hi - lo)
+                        self._codec(
+                            _decode_kernel,
+                            *codes,
+                            out[lo:hi],
+                            n=hi - lo,
+                            MODE=ag_fmt.mode,
+                        )
                 else:
                     memcpy(out_ptr + lo * es, ag_ptr + off, nbytes, s_loc)
                 continue
+            # The cross-pair payload's place in recv_rs, the host slots and recv_x.
+            xoff, xbytes = span(x_fmt, a, b)
+            xoff += self._x_base
             # 1b. recv_rs = recv_rs + my half of my input
             wait(s_k1, flag[partner][_RS], tag, _WAIT_GEQ)
             with torch.cuda.stream(t_k1):
                 if quant:
-                    codes = self._codes(self._recv_rs, off, b - a)
                     self._codec(
-                        _decode_add_encode_kernel, *codes, inp[lo:hi], *codes, n=b - a
+                        _decode_add_encode_kernel,
+                        *rs_fmt.views(self._recv_rs, span(rs_fmt, a, b)[0], b - a),
+                        inp[lo:hi],
+                        *x_fmt.views(self._recv_rs, xoff, b - a),
+                        n=b - a,
+                        MODE_IN=rs_fmt.mode,
+                        MODE_OUT=x_fmt.mode,
                     )
                 else:
                     part = self._recv_rs.view(inp.dtype)[a:b]
@@ -699,11 +870,11 @@ class PcieCeAllReduce:
             # 2a. partial sum -> my host slot, alternating with the partner
             wait_event(s_out, summed[c], 0)
             wait(s_out, flag[partner][_X], (seq + c + turn) & _U32, _WAIT_GEQ)
-            memcpy(my_slot + off, rs_ptr + off, nbytes, s_out)
+            memcpy(my_slot + xoff, rs_ptr + xoff, xbytes, s_out)
             write(s_out, flag[me][_X], tag, _WRITE_FENCED)
             # 2b. cross peer's partial sum -> recv_x
             wait(s_h2d, flag[cross][_X], tag, _WAIT_GEQ)
-            memcpy(x_ptr + off, cross_slot + off, nbytes, s_h2d)
+            memcpy(x_ptr + xoff, cross_slot + xoff, xbytes, s_h2d)
             record(landed[c], s_h2d)
             # 2c. out[my half] = recv_rs + recv_x
             wait_event(s_k2, summed[c], 0)
@@ -713,16 +884,18 @@ class PcieCeAllReduce:
                     # The lower rank's pair goes first on both cross peers.
                     # The encoded result stays in recv_x for the all-gather,
                     # so the partner decodes exactly my out.
-                    ours = self._codes(self._recv_rs, off, b - a)
-                    theirs_x = self._codes(self._recv_x, off, b - a)
+                    ours = x_fmt.views(self._recv_rs, xoff, b - a)
+                    theirs_x = x_fmt.views(self._recv_x, xoff, b - a)
                     first, second = (ours, theirs_x) if me < cross else (theirs_x, ours)
                     self._codec(
                         _decode2_add_encode_kernel,
                         *first,
                         *second,
-                        *theirs_x,
+                        *ag_fmt.views(self._recv_x, off, b - a),
                         out[lo:hi],
                         n=b - a,
+                        MODE_IN=x_fmt.mode,
+                        MODE_OUT=ag_fmt.mode,
                     )
                 else:
                     rs, x = (
@@ -741,24 +914,6 @@ class PcieCeAllReduce:
         # all-reduce in 1.4-1.6 ms against 2.2-2.3 ms for 8 warps; idle is equal.
         _add_kernel[(self.num_ctas,)](a, b, out, a.numel(), BLOCK=2048, num_warps=4)
 
-    def _codes(self, buf: torch.Tensor, off: int, n: int):
-        """Code and scale views of the n-element encoded chunk at byte ``off``."""
-        qb = self.quant_block
-        padded = _round_up(n, qb)
-        codes = self._code_bytes(padded)
-        scales = buf[off + codes : off + codes + padded // qb * 4]
-        return buf[off : off + codes], scales.view(torch.float32)
-
-    def _code_bytes(self, n: int) -> int:
-        return n // 2 if self.quant == "fp4" else n
-
-    def _codec(self, kernel, *args, n: int) -> None:
-        qb = self.quant_block
-        kernel[(self.num_ctas,)](
-            *args,
-            n,
-            QB=qb,
-            ROWS=2048 // qb,
-            MODE=_QUANT_MODES.index(self.quant),
-            num_warps=4,
-        )
+    def _codec(self, kernel, *args, n: int, **modes: int) -> None:
+        qb = self.rs_fmt.block
+        kernel[(self.num_ctas,)](*args, n, QB=qb, ROWS=2048 // qb, num_warps=4, **modes)

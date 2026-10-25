@@ -4,8 +4,8 @@
 
 Messages are [tokens, 4096] bf16, so 128/512/2048/4096/8192 tokens are
 1/4/16/33/67 MB. Under contention every GPU loops a bf16 matmul on a side
-stream for the whole timed window. ``--quant int8 fp8`` adds the quantized
-wire modes and an accuracy table on hidden-state-like activations.
+stream for the whole timed window. ``--quant fp4 fp8/16+fp4/16`` adds the
+quantized wire modes and an accuracy table on hidden-state-like activations.
 """
 
 import argparse
@@ -220,8 +220,7 @@ def main():
     p.add_argument("--gemm-n", type=int, default=8192)
     p.add_argument("--chunk-mb", type=float, default=4)
     p.add_argument("--ctas", type=int, default=16)
-    p.add_argument("--quant", nargs="*", default=[], choices=["int8", "fp8"])
-    p.add_argument("--quant-block", type=int, default=32)
+    p.add_argument("--quant", nargs="*", default=[])
     p.add_argument("--accuracy-tokens", type=int, default=4096)
     p.add_argument("--outliers", type=int, default=8)
     p.add_argument("--skip-contention", action="store_true")
@@ -239,7 +238,6 @@ def main():
             chunk_bytes=int(args.chunk_mb * (1 << 20)),
             num_ctas=args.ctas,
             quant=quant,
-            quant_block=args.quant_block,
         )
         for name, quant in [("ce", None)] + [(f"ce-{q}", q) for q in args.quant]
     }
@@ -264,9 +262,7 @@ def main():
     acc = accuracy(methods, args.accuracy_tokens, args.outliers)
     gemm = None if args.skip_contention else Gemm(args.gemm_n)
     if rank == 0:
-        print(
-            f"topology {comm.topo} chunk {args.chunk_mb} MB ctas {args.ctas} quant block {args.quant_block}"
-        )
+        print(f"topology {comm.topo} chunk {args.chunk_mb} MB ctas {args.ctas}")
         print(
             f"stress ce: {args.rounds * 6} back-to-back calls, {mismatches} mismatches vs exact reference"
         )
