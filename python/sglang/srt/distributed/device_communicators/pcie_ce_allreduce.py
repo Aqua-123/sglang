@@ -54,7 +54,7 @@ _RS, _X, _AG, _DONE = range(4)
 _STAGES = ("out", "k0", "k1", "h2d", "k2", "loc")
 # Streams that launch kernels: k0 quantizes, loc dequantizes in quantized mode.
 _KERNEL_STAGES = ("k0", "k1", "k2", "loc")
-_QUANT_MODES = ("int8", "fp8")
+_QUANT_MODES = ("int8", "fp8", "fp4")  # index = the kernels' MODE
 _MAX_CHUNKS = 16
 # Outbound schedule offsets, tuned on 8x RTX PRO 6000 (lead=lag=2 beat 1, 3, 8).
 _LEAD = 2
@@ -89,7 +89,11 @@ def _add_kernel(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
 
 
 # Quantized wire format. A chunk of E elements travels as one span:
-# [round_up(E, QB) int8 or fp8 codes | one fp32 scale per QB-element block].
+# [round_up(E, QB) codes | one fp32 scale per QB-element block]. int8 and fp8
+# codes take a byte each; fp4 (e2m1) codes pack two to a byte, the even element
+# in the low nibble.
+_FP8 = tl.constexpr(1)
+_FP4 = tl.constexpr(2)
 
 
 @triton.jit
@@ -100,53 +104,125 @@ def _tile(t, n, QB: tl.constexpr, ROWS: tl.constexpr):
 
 
 @triton.jit
-def _decode(q_ptr, s_ptr, rows, offs, mask, row_mask, FP8: tl.constexpr):
-    q = tl.load(q_ptr + offs, mask=mask, other=0)
-    if FP8:
-        v = q.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+def _packed(rows, n, QB: tl.constexpr):
+    """Byte offsets and mask of a tile's packed fp4 codes."""
+    offs = rows[:, None] * (QB // 2) + tl.arange(0, QB // 2)[None, :]
+    return offs, offs * 2 < n
+
+
+@triton.jit
+def _e2m1_value(c):
+    """Value of a 4-bit e2m1 code: +-{0, .5, 1, 1.5, 2, 3, 4, 6}, sign in bit 3."""
+    e = ((c >> 1) & 3).to(tl.float32)
+    m = (c & 1).to(tl.float32)
+    v = tl.where(e == 0, m * 0.5, tl.exp2(e - 1.0) * (1.0 + m * 0.5))
+    return tl.where((c & 8) != 0, -v, v)
+
+
+@triton.jit
+def _e2m1_code(y):
+    """Nearest e2m1 code of y in [-6, 6]."""
+    a = tl.abs(y)
+    c = (
+        (a >= 0.25).to(tl.int32)
+        + (a >= 0.75).to(tl.int32)
+        + (a >= 1.25).to(tl.int32)
+        + (a >= 1.75).to(tl.int32)
+        + (a >= 2.5).to(tl.int32)
+        + (a >= 3.5).to(tl.int32)
+        + (a >= 5.0).to(tl.int32)
+    )
+    return c | tl.where(y < 0, 8, 0)
+
+
+@triton.jit
+def _decode(
+    q_ptr,
+    s_ptr,
+    rows,
+    offs,
+    mask,
+    row_mask,
+    n,
+    QB: tl.constexpr,
+    ROWS: tl.constexpr,
+    MODE: tl.constexpr,
+):
+    if MODE == _FP4:
+        boffs, bmask = _packed(rows, n, QB)
+        b = tl.load(q_ptr + boffs, mask=bmask, other=0).to(tl.int32)
+        v = tl.reshape(tl.join(_e2m1_value(b & 15), _e2m1_value(b >> 4)), (ROWS, QB))
     else:
-        v = q.to(tl.int8, bitcast=True).to(tl.float32)
+        q = tl.load(q_ptr + offs, mask=mask, other=0)
+        if MODE == _FP8:
+            v = q.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        else:
+            v = q.to(tl.int8, bitcast=True).to(tl.float32)
     return v * tl.load(s_ptr + rows, mask=row_mask, other=0.0)[:, None]
 
 
 @triton.jit
-def _encode(v, q_ptr, s_ptr, rows, offs, mask, row_mask, FP8: tl.constexpr):
+def _encode(
+    v,
+    q_ptr,
+    s_ptr,
+    rows,
+    offs,
+    mask,
+    row_mask,
+    n,
+    QB: tl.constexpr,
+    ROWS: tl.constexpr,
+    MODE: tl.constexpr,
+):
     """Store v block-scaled; return the values a receiver will decode."""
-    qmax = 448.0 if FP8 else 127.0
+    if MODE == _FP4:
+        qmax = 6.0
+    elif MODE == _FP8:
+        qmax = 448.0
+    else:
+        qmax = 127.0
     amax = tl.max(tl.abs(tl.where(mask, v, 0.0)), axis=1)
     scale = amax / qmax
     y = v * tl.where(amax > 0, qmax / amax, 0.0)[:, None]
-    if FP8:
-        qf = y.to(tl.float8e4nv).to(tl.float32)
-        q = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    if MODE == _FP4:
+        c = _e2m1_code(y)
+        lo, hi = tl.split(tl.reshape(c, (ROWS, QB // 2, 2)))
+        boffs, bmask = _packed(rows, n, QB)
+        tl.store(q_ptr + boffs, (lo | (hi << 4)).to(tl.uint8), mask=bmask)
+        qf = _e2m1_value(c)
     else:
-        qf = tl.where(y >= 0, y + 0.5, y - 0.5).to(tl.int32).to(tl.float32)
-        q = qf.to(tl.int8).to(tl.uint8, bitcast=True)
-    tl.store(q_ptr + offs, q, mask=mask)
+        if MODE == _FP8:
+            qf = y.to(tl.float8e4nv).to(tl.float32)
+            q = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        else:
+            qf = tl.where(y >= 0, y + 0.5, y - 0.5).to(tl.int32).to(tl.float32)
+            q = qf.to(tl.int8).to(tl.uint8, bitcast=True)
+        tl.store(q_ptr + offs, q, mask=mask)
     tl.store(s_ptr + rows, scale, mask=row_mask)
     return qf * scale[:, None]
 
 
 @triton.jit
 def _quant_kernel(
-    x_ptr, q_ptr, s_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+    x_ptr, q_ptr, s_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, MODE: tl.constexpr
 ):
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
         v = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        _encode(v, q_ptr, s_ptr, rows, offs, mask, row_mask, FP8)
+        _encode(v, q_ptr, s_ptr, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
 
 
 @triton.jit
 def _decode_add_encode_kernel(
-    aq, as_, x_ptr, oq, os_, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+    aq, as_, x_ptr, oq, os_, n, QB: tl.constexpr, ROWS: tl.constexpr, MODE: tl.constexpr
 ):
     """o = encode(decode(a) + x); o may alias a."""
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
-        v = _decode(aq, as_, rows, offs, mask, row_mask, FP8)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
         v += tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        _encode(v, oq, os_, rows, offs, mask, row_mask, FP8)
+        _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
 
 
 @triton.jit
@@ -161,26 +237,26 @@ def _decode2_add_encode_kernel(
     n,
     QB: tl.constexpr,
     ROWS: tl.constexpr,
-    FP8: tl.constexpr,
+    MODE: tl.constexpr,
 ):
     """o = encode(decode(a) + decode(b)); out = what o decodes to. o may alias
     an input. The compiler fuses one decode into an FMA, so the sum is only
     bitwise reproducible if every rank passes the operands in the same order."""
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
-        v = _decode(aq, as_, rows, offs, mask, row_mask, FP8)
-        v += _decode(bq, bs, rows, offs, mask, row_mask, FP8)
-        v = _encode(v, oq, os_, rows, offs, mask, row_mask, FP8)
+        v = _decode(aq, as_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
+        v += _decode(bq, bs, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
+        v = _encode(v, oq, os_, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
         tl.store(out_ptr + offs, v.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
 def _decode_kernel(
-    q_ptr, s_ptr, out_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, FP8: tl.constexpr
+    q_ptr, s_ptr, out_ptr, n, QB: tl.constexpr, ROWS: tl.constexpr, MODE: tl.constexpr
 ):
     for t in range(tl.program_id(0), tl.cdiv(n, QB * ROWS), tl.num_programs(0)):
         rows, offs, mask, row_mask = _tile(t, n, QB, ROWS)
-        v = _decode(q_ptr, s_ptr, rows, offs, mask, row_mask, FP8)
+        v = _decode(q_ptr, s_ptr, rows, offs, mask, row_mask, n, QB, ROWS, MODE)
         tl.store(out_ptr + offs, v.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -296,8 +372,9 @@ class PcieCeAllReduce:
         quant: Optional[str] = None,
         quant_block: int = 32,
     ):
-        """``quant`` ("int8" or "fp8") sends every payload block-scaled with one
-        fp32 scale per ``quant_block`` elements, halving link bytes. Each hop
+        """``quant`` ("int8", "fp8" or "fp4") sends every payload block-scaled with
+        one fp32 scale per ``quant_block`` elements: int8 and fp8 halve link bytes,
+        fp4 (e2m1) quarters them. Each hop
         re-quantizes, so the result carries three rounding steps; ranks stay
         bitwise equal. On activations with outlier channels fp8 e4m3 is the
         more accurate: an outlier sets its block's int8 step for every other
@@ -541,7 +618,9 @@ class PcieCeAllReduce:
                 return a * es, (b - a) * es
             qb = self.quant_block
             padded = _round_up(b - a, qb)
-            return a + a // qb * 4, padded + padded // qb * 4
+            return self._code_bytes(a) + a // qb * 4, (
+                self._code_bytes(padded) + padded // qb * 4
+            )
 
         caller = drv.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
         record(start, caller)
@@ -651,11 +730,20 @@ class PcieCeAllReduce:
         """Code and scale views of the n-element encoded chunk at byte ``off``."""
         qb = self.quant_block
         padded = _round_up(n, qb)
-        scales = buf[off + padded : off + padded + padded // qb * 4]
-        return buf[off : off + padded], scales.view(torch.float32)
+        codes = self._code_bytes(padded)
+        scales = buf[off + codes : off + codes + padded // qb * 4]
+        return buf[off : off + codes], scales.view(torch.float32)
+
+    def _code_bytes(self, n: int) -> int:
+        return n // 2 if self.quant == "fp4" else n
 
     def _codec(self, kernel, *args, n: int) -> None:
         qb = self.quant_block
         kernel[(self.num_ctas,)](
-            *args, n, QB=qb, ROWS=2048 // qb, FP8=self.quant == "fp8", num_warps=4
+            *args,
+            n,
+            QB=qb,
+            ROWS=2048 // qb,
+            MODE=_QUANT_MODES.index(self.quant),
+            num_warps=4,
         )
