@@ -201,6 +201,43 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+def _pcie_ce_all_reduce(
+    tensor: torch.Tensor, out: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return _groups[group_name]().pcie_ce_comm.all_reduce(tensor, out=out)
+
+
+_pcie_ce_graph_break = None
+
+
+def _pcie_ce_all_reduce_graph_break(
+    group: "GroupCoordinator", tensor: torch.Tensor
+) -> torch.Tensor:
+    """The copy-engine all-reduce as an eager break of a breakable prefill graph:
+    the graph segments around it replay, the all-reduce itself runs eagerly.
+
+    A break keeps its output alive as the bridge into the next segment, so a
+    fresh output per break would pin every layer's activations (6 GB for one
+    8K-token graph). Consecutive breaks alternate between two group-owned
+    bridges instead: each result is consumed by the next norm before the
+    following all-reduce runs."""
+    global _pcie_ce_graph_break
+    if _pcie_ce_graph_break is None:
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            eager_on_graph,
+        )
+
+        _pcie_ce_graph_break = eager_on_graph(_pcie_ce_all_reduce)
+    bridge = group._pcie_ce_bridges[group._pcie_ce_bridge_next]
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes <= bridge.numel():
+        group._pcie_ce_bridge_next ^= 1
+        out = bridge[:nbytes].view(tensor.dtype).view(tensor.shape)
+    else:
+        out = tensor
+    return _pcie_ce_graph_break(tensor, out, group.unique_name)
+
+
 @register_custom_op(out_shape="tensor")
 def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     """FlashInfer kAllReduce over ``group_name``.
@@ -544,6 +581,13 @@ class GroupCoordinator:
                 )
             except Exception as e:
                 logger.warning(f"Setup PCIe copy-engine allreduce failed with {e}.")
+            if self.pcie_ce_comm is not None and not self.pcie_ce_comm.disabled:
+                # Graph-break outputs; see _pcie_ce_all_reduce_graph_break.
+                self._pcie_ce_bridges = [
+                    torch.empty(64 << 20, dtype=torch.uint8, device=self.device)
+                    for _ in range(2)
+                ]
+                self._pcie_ce_bridge_next = 0
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -820,6 +864,9 @@ class GroupCoordinator:
         if self._can_use_flashinfer_allreduce(input_):
             return flashinfer_allreduce(input_, group_name=self.unique_name)
 
+        if self._pcie_ce_breaks_graph(input_):
+            return _pcie_ce_all_reduce_graph_break(self, input_)
+
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,
             should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
@@ -985,6 +1032,22 @@ class GroupCoordinator:
             )
         except Exception:
             return None
+
+    def _pcie_ce_breaks_graph(self, input_: torch.Tensor) -> bool:
+        if self.pcie_ce_comm is None or not torch.cuda.is_current_stream_capturing():
+            return False
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+
+        return (
+            is_in_breakable_cuda_graph()
+            and not (
+                self.pcie_pair_comm is not None
+                and self.pcie_pair_comm.should_use(input_)
+            )
+            and self.pcie_ce_comm.fits(input_)
+        )
 
     def _resolve_outplace_all_reduce_method(
         self,

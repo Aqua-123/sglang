@@ -524,6 +524,12 @@ class PcieCeAllReduce:
     # ---- public API ----------------------------------------------------------
 
     def should_use(self, tensor: torch.Tensor) -> bool:
+        return self.fits(tensor) and not torch.cuda.is_current_stream_capturing()
+
+    def fits(self, tensor: torch.Tensor) -> bool:
+        """Whether tensor suits this all-reduce. Its per-call counters are
+        baked into whatever it enqueues, so it must run eagerly: outside graph
+        capture, or as an eager break of a breakable graph."""
         return (
             not self.disabled
             and tensor.is_cuda
@@ -531,12 +537,16 @@ class PcieCeAllReduce:
             and tensor.is_contiguous()
             and tensor.numel() * tensor.element_size()
             >= max(self.min_bytes, _MIN_BYTES_FLOOR)
-            and not torch.cuda.is_current_stream_capturing()
         )
 
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Out-of-place sum over the group; ``tensor`` is not modified."""
-        out = torch.empty_like(tensor)
+    def all_reduce(
+        self, tensor: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Sum over the group into ``out``, a new tensor by default. ``out`` may be
+        ``tensor``: each output range is written only after events that follow
+        the last read of the same input range."""
+        if out is None:
+            out = torch.empty_like(tensor)
         flat_in, flat_out = tensor.view(-1), out.view(-1)
         n = flat_in.numel()
         # Equal segments, so none is too small to split into halves.
