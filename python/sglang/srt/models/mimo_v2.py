@@ -555,10 +555,13 @@ class MiMoV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
