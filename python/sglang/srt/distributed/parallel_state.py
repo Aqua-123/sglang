@@ -501,6 +501,27 @@ class GroupCoordinator:
             except Exception as e:
                 logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
 
+        self.pcie_pair_comm: Optional[Any] = None
+        if (
+            envs.SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES.get() > 0
+            and group_name == "tp"
+            and self.world_size == 4
+            and is_cuda()
+            and not self._deterministic_collectives_enabled()
+        ):
+            from sglang.srt.distributed.device_communicators.pcie_pair_allreduce import (
+                PciePairAllReduce,
+            )
+
+            try:
+                self.pcie_pair_comm = PciePairAllReduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    max_bytes=envs.SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES.get(),
+                )
+            except Exception as e:
+                logger.warning(f"Setup PCIe pair allreduce failed with {e}.")
+
         self.pcie_ce_comm: Optional[Any] = None
         if (
             envs.SGLANG_PCIE_CE_ALLREDUCE.get()
@@ -992,6 +1013,8 @@ class GroupCoordinator:
             and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
         ):
             return "pcie_ipc"
+        if self.pcie_pair_comm is not None and self.pcie_pair_comm.should_use(input_):
+            return "pcie_pair"
         # Large eager reductions only: should_use refuses during graph capture.
         if self.pcie_ce_comm is not None and self.pcie_ce_comm.should_use(input_):
             return "pcie_ce"
@@ -1078,6 +1101,8 @@ class GroupCoordinator:
             out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_pair":
+            return self.pcie_pair_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ce":
             return self.pcie_ce_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
@@ -2122,6 +2147,9 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        if self.pcie_pair_comm is not None:
+            self.pcie_pair_comm.destroy()
+            self.pcie_pair_comm = None
         if self.pcie_ce_comm is not None:
             self.pcie_ce_comm.destroy()
             self.pcie_ce_comm = None

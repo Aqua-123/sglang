@@ -1515,6 +1515,9 @@ class Envs:
     # CTAs for the CE add/quant kernels. Prefill all-reduces do not overlap compute, so a
     # full-GPU grid finishes them fastest; a small grid only helps when competing for SMs.
     SGLANG_PCIE_CE_ALLREDUCE_CTAS = EnvInt(16)
+    # One-kernel all-reduce for two PCIe-switch pairs (pcie_pair_allreduce.py), for bf16
+    # reductions up to this many bytes, including inside CUDA graphs. 0 disables.
+    SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES = EnvInt(0)
 
     # ===================================================================
     # RoPE cache
