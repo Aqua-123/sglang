@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.kernels.ops.attention import long_prefill_int8
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
@@ -1370,6 +1371,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _long_prefill_int8(self, layer, forward_batch, metadata, *, plain) -> bool:
+        return (
+            plain
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self.page_size == 1
+            and metadata is not self.full_cg_prefill_metadata
+            and layer.head_dim == 192
+            and layer.v_head_dim == 128
+            and long_prefill_int8.wants(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            )
+        )
+
     def get_paged_mha_kv_cache(
         self,
         layer: RadixAttention,
@@ -1785,6 +1800,46 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif self._long_prefill_int8(
+                layer,
+                forward_batch,
+                metadata,
+                plain=not (
+                    is_swa_layer
+                    or use_local_attn
+                    or use_cascade_attn
+                    or kwargs
+                    or layer.logit_cap
+                    or return_lse
+                    or not causal
+                ),
+            ):
+                result = long_prefill_int8.long_prefill_attention(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache[:, 0],
+                    value_cache[:, 0],
+                    page_table,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    layer.scaling,
+                    out=_fa_out,
+                )
+                if long_prefill_int8.CHECK:
+                    ref = flash_attn_with_kvcache(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k_new=cu_seqlens_k,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
+                    )
+                    long_prefill_int8.report(layer.layer_id, forward_batch, result, ref)
             else:
                 # MTP target-verify is decode-shaped (a few query tokens per request over the
                 # whole context). On runtimes that only plan SplitKV for decode, give it the
