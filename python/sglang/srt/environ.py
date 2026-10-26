@@ -1519,6 +1519,12 @@ class Envs:
     # One-kernel all-reduce for two PCIe-switch pairs (pcie_pair_allreduce.py), for bf16
     # reductions up to this many bytes, including inside CUDA graphs. 0 disables.
     SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES = EnvInt(0)
+    # Pair all-reduces of at least this many bytes send e4m3 codes with a bf16 scale per
+    # _FP8_GROUP (16 or 32) elements over the reduce-scatter and host exchange, and over the
+    # all-gather too with _FP8_ALL_GATHER. Lossy. 0 disables.
+    SGLANG_PCIE_PAIR_ALLREDUCE_FP8_MIN_BYTES = EnvInt(0)
+    SGLANG_PCIE_PAIR_ALLREDUCE_FP8_GROUP = EnvInt(16)
+    SGLANG_PCIE_PAIR_ALLREDUCE_FP8_ALL_GATHER = EnvBool(False)
     # Keep every vocab shard of the target lm_head on every TP rank and compute logits for at
     # least this many rows locally instead of all-gathering them. 0 disables.
     SGLANG_REPLICATED_LM_HEAD_MIN_ROWS = EnvInt(0)

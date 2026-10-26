@@ -555,6 +555,9 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                     max_bytes=envs.SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES.get(),
+                    fp8_min_bytes=envs.SGLANG_PCIE_PAIR_ALLREDUCE_FP8_MIN_BYTES.get(),
+                    fp8_group=envs.SGLANG_PCIE_PAIR_ALLREDUCE_FP8_GROUP.get(),
+                    fp8_all_gather=envs.SGLANG_PCIE_PAIR_ALLREDUCE_FP8_ALL_GATHER.get(),
                 )
             except Exception as e:
                 logger.warning(f"Setup PCIe pair allreduce failed with {e}.")
