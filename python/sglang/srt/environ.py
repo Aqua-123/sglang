@@ -1519,6 +1519,9 @@ class Envs:
     # One-kernel all-reduce for two PCIe-switch pairs (pcie_pair_allreduce.py), for bf16
     # reductions up to this many bytes, including inside CUDA graphs. 0 disables.
     SGLANG_PCIE_PAIR_ALLREDUCE_MAX_BYTES = EnvInt(0)
+    # Keep every vocab shard of the target lm_head on every TP rank and compute logits for at
+    # least this many rows locally instead of all-gathering them. 0 disables.
+    SGLANG_REPLICATED_LM_HEAD_MIN_ROWS = EnvInt(0)
 
     # ===================================================================
     # RoPE cache

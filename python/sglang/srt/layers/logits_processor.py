@@ -484,6 +484,8 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        # [tp_size, shard, hidden]: every rank's lm_head shard, set by replicate_lm_head.
+        self.replicated_lm_head_weight: Optional[torch.Tensor] = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -921,10 +923,14 @@ class LogitsProcessor(nn.Module):
             if use_logits_buffer and not self.do_tensor_parallel_all_gather
             else None
         )
+        replicated = self._uses_replicated_lm_head(hidden_states, embedding_bias)
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(
-                hidden_states, lm_head, embedding_bias, out=logits_buffer
-            )
+            if replicated:
+                logits = self._compute_replicated_lm_head(hidden_states)
+            else:
+                logits = self._compute_lm_head(
+                    hidden_states, lm_head, embedding_bias, out=logits_buffer
+                )
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -934,7 +940,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self._can_gather_softcap_fused(
+        if not replicated and self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
         ):
             if (
@@ -947,7 +953,7 @@ class LogitsProcessor(nn.Module):
             )
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if self.do_tensor_parallel_all_gather and not replicated:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
@@ -996,6 +1002,31 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _uses_replicated_lm_head(
+        self, hidden_states: torch.Tensor, embedding_bias: Optional[torch.Tensor]
+    ) -> bool:
+        return (
+            self.replicated_lm_head_weight is not None
+            and embedding_bias is None
+            and hidden_states.shape[0]
+            >= envs.SGLANG_REPLICATED_LM_HEAD_MIN_ROWS.get()
+        )
+
+    def _compute_replicated_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits without a gather. Each shard runs the same GEMM its owning
+        rank would, so the result is bitwise equal to the all-gathered logits."""
+        weight = self.replicated_lm_head_weight
+        world, shard_width, _ = weight.shape
+        hidden_states = hidden_states.to(weight.dtype)
+        shards = torch.empty(
+            (world, hidden_states.shape[0], shard_width),
+            dtype=weight.dtype,
+            device=hidden_states.device,
+        )
+        for rank in range(world):
+            torch.mm(hidden_states, weight[rank].T, out=shards[rank])
+        return shards.movedim(0, 1).reshape(hidden_states.shape[0], -1)
 
     def _can_gather_softcap_fused(
         self,
@@ -1587,3 +1618,48 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def replicate_lm_head(model: nn.Module) -> None:
+    """All-gather the target's vocab-parallel lm_head once so every rank holds all shards.
+
+    The rank's own shard becomes a view into the gathered weight, so the added memory is the
+    other ranks' shards. Only a plain fp16/bf16 TP lm_head qualifies."""
+    lm_head = getattr(model, "lm_head", None)
+    processor = getattr(model, "logits_processor", None)
+    if not isinstance(processor, LogitsProcessor) or not isinstance(
+        lm_head, VocabParallelEmbedding
+    ):
+        return
+    weight = getattr(lm_head, "weight", None)
+    if (
+        not processor.do_tensor_parallel_all_gather
+        or processor.do_tensor_parallel_all_gather_dp_attn
+        or processor.use_attn_tp_group
+        or processor.use_tp_lm_head_all_to_all
+        or processor.use_fp32_lm_head
+        or processor.use_fp32_lm_head_output
+        or processor.rl_on_policy_target is not None
+        or hasattr(lm_head, "set_lora")
+        or getattr(lm_head, "bias", None) is not None
+        or should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        )
+        or weight is None
+        or weight.dim() != 2
+        or weight.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        logger.info("Replicated lm_head disabled: lm_head layout not supported.")
+        return
+    group = get_parallel().tp_group
+    full = torch.empty(
+        (group.world_size, *weight.shape), dtype=weight.dtype, device=weight.device
+    )
+    group.all_gather_into_tensor(full.view(-1, weight.shape[1]), weight.data.contiguous())
+    weight.data = full[group.rank_in_group]
+    processor.replicated_lm_head_weight = full
+    logger.info(
+        "Replicated lm_head: +%.2f GB per rank, local logits for >= %d rows.",
+        (full.numel() - weight.numel()) * full.element_size() / 1e9,
+        envs.SGLANG_REPLICATED_LM_HEAD_MIN_ROWS.get(),
+    )

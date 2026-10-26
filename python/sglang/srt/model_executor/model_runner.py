@@ -821,6 +821,14 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if get_parallel().tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+        if (
+            envs.SGLANG_REPLICATED_LM_HEAD_MIN_ROWS.get() > 0
+            and get_parallel().tp_size > 1
+            and not self.is_draft_worker
+        ):
+            from sglang.srt.layers.logits_processor import replicate_lm_head
+
+            replicate_lm_head(self.model)
 
     def maybe_init_lora_manager(self):
         if self.spec_algorithm.is_uno():
