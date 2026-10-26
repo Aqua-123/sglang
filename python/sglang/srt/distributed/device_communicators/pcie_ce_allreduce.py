@@ -285,12 +285,13 @@ def _encode(
     amax = tl.max(tl.abs(tl.where(mask, v, 0.0)), axis=1)
     if s_ptr.dtype.element_ty == tl.float32:
         scale = amax / qmax
-        y = v * tl.where(amax > 0, qmax / amax, 0.0)[:, None]
+        y = v * tl.where(amax > 1e-30, qmax / amax, 0.0)[:, None]
     else:
         # A bf16 scale rounds to nearest, so y may pass qmax by 2^-9 relative;
         # every code kind rounds that back to qmax.
         scale = (amax / qmax).to(s_ptr.dtype.element_ty).to(tl.float32)
-        y = v * tl.where(scale > 0, 1.0 / scale, 0.0)[:, None]
+        # Below 1e-30 the reciprocal can overflow; such blocks encode as zero.
+        y = v * tl.where(scale > 1e-30, 1.0 / scale, 0.0)[:, None]
     if MODE == _FP4:
         c = _e2m1_code(y)
         lo, hi = tl.split(tl.reshape(c, (ROWS, QB // 2, 2)))

@@ -260,8 +260,8 @@ __device__ __forceinline__ void decode(const uint4 (&c)[VG / 2], uint16_t s, flo
       __half2_raw r = __nv_cvt_fp8x2_to_halfraw2(
           static_cast<__nv_fp8x2_storage_t>(w[k / 2] >> (16 * (k % 2))), __NV_E4M3);
       const float2 f = __half22float2(__half2(r));
-      x[16 * m + 2 * k] = f.x * sf;
-      x[16 * m + 2 * k + 1] = f.y * sf;
+      x[16 * m + 2 * k] = __fmul_rn(f.x, sf);
+      x[16 * m + 2 * k + 1] = __fmul_rn(f.y, sf);
     }
   }
 }
